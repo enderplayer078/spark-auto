@@ -1,0 +1,17 @@
+.sessions/
+functions/
+index.html
+styles.css
+app.js
+firebase.json
+database.rules.json
+.firebaserc
+answers_db.json
+queue_state.json
+.env
+.firebase/
+__pycache__/
+*.py[cod]
+.DS_Store
+*.log
+firebase-debug.log*
