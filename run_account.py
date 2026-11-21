@@ -161,10 +161,11 @@ def run_activity(driver, url, row, folder, activity_db=None, quiet_logs=False):
         )
         cur_info = solver.get_screen_info(driver)
         expected = expected_screens[s_idx] if s_idx < len(expected_screens) else None
-        print(
-            f"  [{name}] screen {s_idx + 1}/{total_screens} ({cur_info['identifier']})",
-            flush=True,
-        )
+        if not quiet_logs:
+            print(
+                f"  [{name}] screen {s_idx + 1}/{total_screens} ({cur_info['identifier']})",
+                flush=True,
+            )
 
         solver.solve_current_screen(driver, expected_screen=expected)
         verified = answer_guard.verify_screen(driver, expected_screen=expected)

@@ -34,7 +34,7 @@ def _is_logged_in(driver):
     return False
 
 
-def open_session(username, password=None, headed=False):
+def open_session(username, password=None, headed=False, persist_session=True):
     folder = session_folder(username)
     options = webdriver.ChromeOptions()
     options.add_argument(f"--user-data-dir={folder / 'profile'}")
@@ -145,7 +145,8 @@ def open_session(username, password=None, headed=False):
         driver.quit()
         raise RuntimeError("Login was not confirmed on dashboard/assignments")
 
-    save_session(driver, username, folder)
+    if persist_session:
+        save_session(driver, username, folder)
     return driver, folder
 
 

@@ -16,7 +16,7 @@ from google.auth.transport.requests import Request
 from google.oauth2 import service_account
 import requests
 
-from account_session import open_session
+from account_session import open_session, session_folder
 from run_account import run_remaining
 
 SCOPES = [
@@ -238,7 +238,7 @@ def process_one_job(fb: FirebaseAdminClient, private_key, hmac_secret: str) -> b
     )
 
     driver = None
-    folder = None
+    folder = session_folder(username)
     try:
         def on_progress(done_count, total_count, msg):
             fb.put(f"/ngl_spark_private/active/{salted_key}.json", {"updated_at": time.time()})
@@ -252,7 +252,7 @@ def process_one_job(fb: FirebaseAdminClient, private_key, hmac_secret: str) -> b
                 detail=msg,
             )
 
-        driver, folder = open_session(username, password=password)
+        driver, folder = open_session(username, password=password, persist_session=False)
         run_remaining(
             driver,
             folder,
