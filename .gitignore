@@ -5,6 +5,7 @@ styles.css
 app.js
 firebase.json
 database.rules.json
+robots.txt
 .firebaserc
 answers_db.json
 queue_state.json
