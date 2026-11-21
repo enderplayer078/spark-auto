@@ -6,6 +6,7 @@ import hmac
 import json
 import os
 import re
+import shutil
 import time
 from pathlib import Path
 
@@ -114,11 +115,9 @@ def decrypt_password(private_key, enc_b64: str) -> str:
     return plaintext.decode("utf-8")
 
 
-def compute_account_keys(hmac_secret: str, username: str, password: str) -> tuple[str, str]:
-    payload = f"spark-v2:{username.lower()}:{password}".encode("utf-8")
-    salted_key = hmac.new(hmac_secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
-    legacy_key = hashlib.sha256(payload).hexdigest()
-    return salted_key, legacy_key
+def compute_account_key(hmac_secret: str, username: str) -> str:
+    payload = f"spark-v3:{username.lower()}".encode("utf-8")
+    return hmac.new(hmac_secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
 
 
 def _safe_float(val, default: float = 0.0) -> float:
@@ -128,41 +127,45 @@ def _safe_float(val, default: float = 0.0) -> float:
         return default
 
 
+def cleanup_stale_public_jobs(fb: FirebaseAdminClient, exclude_job_id: str | None = None):
+    now = time.time()
+    jobs_map = fb.get("/ngl_spark_public/jobs.json") or {}
+    if not isinstance(jobs_map, dict):
+        return
+    for jid, j in list(jobs_map.items()):
+        if not SAFE_PUBLIC_ID_RE.fullmatch(str(jid)):
+            continue
+        if (
+            jid != exclude_job_id
+            and isinstance(j, dict)
+            and j.get("status") in ("running", "queued")
+        ):
+            last_ts = _safe_float(j.get("updated_at") or j.get("created_at"), now)
+            if now - last_ts > 1800:
+                fb.patch(
+                    f"/ngl_spark_public/jobs/{jid}.json",
+                    {
+                        "status": "failed",
+                        "updated_at": now,
+                        "detail": "หมดเวลาเชื่อมต่อ กรุณากดยืนยันเพื่อทำต่อจากเดิมอีกครั้ง",
+                    },
+                )
+    if len(jobs_map) > 30:
+        ordered = sorted(
+            jobs_map.items(),
+            key=lambda kv: _safe_float((kv[1] or {}).get("created_at"), 0.0),
+        )
+        for old_jid, _ in ordered[:-30]:
+            if SAFE_PUBLIC_ID_RE.fullmatch(str(old_jid)):
+                fb.delete(f"/ngl_spark_public/jobs/{old_jid}.json")
+
+
 def update_public_job(fb: FirebaseAdminClient, job_id: str, **fields):
     if not SAFE_PUBLIC_ID_RE.fullmatch(str(job_id)):
         raise ValueError("Invalid public job_id")
-    now = time.time()
-    fields["updated_at"] = now
+    fields["updated_at"] = time.time()
     fb.patch(f"/ngl_spark_public/jobs/{job_id}.json", fields)
-
-    jobs_map = fb.get("/ngl_spark_public/jobs.json") or {}
-    if isinstance(jobs_map, dict):
-        for jid, j in list(jobs_map.items()):
-            if not SAFE_PUBLIC_ID_RE.fullmatch(str(jid)):
-                continue
-            if (
-                jid != job_id
-                and isinstance(j, dict)
-                and j.get("status") in ("running", "queued")
-            ):
-                last_ts = _safe_float(j.get("updated_at") or j.get("created_at"), now)
-                if now - last_ts > 1800:
-                    fb.patch(
-                        f"/ngl_spark_public/jobs/{jid}.json",
-                        {
-                            "status": "failed",
-                            "updated_at": now,
-                            "detail": "หมดเวลาเชื่อมต่อ กรุณากดยืนยันเพื่อทำต่อจากเดิมอีกครั้ง",
-                        },
-                    )
-        if len(jobs_map) > 30:
-            ordered = sorted(
-                jobs_map.items(),
-                key=lambda kv: _safe_float((kv[1] or {}).get("created_at"), 0.0),
-            )
-            for old_jid, _ in ordered[:-30]:
-                if SAFE_PUBLIC_ID_RE.fullmatch(str(old_jid)):
-                    fb.delete(f"/ngl_spark_public/jobs/{old_jid}.json")
+    cleanup_stale_public_jobs(fb, exclude_job_id=job_id)
 
 
 def increment_completed_stats(fb: FirebaseAdminClient):
@@ -178,7 +181,7 @@ def process_one_job(fb: FirebaseAdminClient, private_key, hmac_secret: str) -> b
 
     items = []
     for k, v in inbox.items():
-        if (
+        valid_item = (
             isinstance(v, dict)
             and SAFE_ID_RE.fullmatch(str(k))
             and v.get("job_id") == k
@@ -187,8 +190,14 @@ def process_one_job(fb: FirebaseAdminClient, private_key, hmac_secret: str) -> b
             and SAFE_USERNAME_RE.fullmatch(v["username"])
             and isinstance(v.get("encrypted_password"), str)
             and 100 <= len(v["encrypted_password"]) <= 1024
-        ):
+        )
+        if valid_item:
             items.append((k, v))
+        elif SAFE_PUBLIC_ID_RE.fullmatch(str(k)):
+            try:
+                fb.delete(f"/ngl_spark_private/inbox/{k}.json")
+            except Exception:
+                pass
     if not items:
         return False
 
@@ -200,33 +209,23 @@ def process_one_job(fb: FirebaseAdminClient, private_key, hmac_secret: str) -> b
 
     # Claim the job and immediately delete encrypted credentials from inbox.
     fb.delete(f"/ngl_spark_private/inbox/{job_id}.json")
-    print(f"[worker] Claimed job {job_id}", flush=True)
+    print("[worker] Claimed 1 job", flush=True)
 
     try:
         password = decrypt_password(private_key, enc_password)
         if not password or len(password) > 64:
             raise ValueError("Invalid decrypted password length")
     except Exception as exc:
-        print(f"[worker] Rejected undecryptable job {job_id}: {type(exc).__name__}", flush=True)
+        print(f"[worker] Rejected undecryptable job: {type(exc).__name__}", flush=True)
         fb.delete(f"/ngl_spark_public/jobs/{job_id}.json")
         return True
 
-    salted_key, legacy_key = compute_account_keys(hmac_secret, username, password)
+    salted_key = compute_account_key(hmac_secret, username)
 
     existing_completed = fb.get(f"/ngl_spark_private/completed/{salted_key}.json")
-    existing_legacy = (
-        None
-        if (isinstance(existing_completed, dict) and existing_completed.get("completed"))
-        else fb.get(f"/ngl_spark_private/completed/{legacy_key}.json")
-    )
-    if (isinstance(existing_completed, dict) and existing_completed.get("completed")) or (
-        isinstance(existing_legacy, dict) and existing_legacy.get("completed")
-    ):
-        if isinstance(existing_legacy, dict) and existing_legacy.get("completed"):
-            fb.put(f"/ngl_spark_private/completed/{salted_key}.json", existing_legacy)
-            fb.delete(f"/ngl_spark_private/completed/{legacy_key}.json")
+    if isinstance(existing_completed, dict) and existing_completed.get("completed"):
         fb.delete(f"/ngl_spark_public/jobs/{job_id}.json")
-        print(f"[worker] Skipped already-completed job {job_id}", flush=True)
+        print("[worker] Skipped already-completed job", flush=True)
         return True
 
     fb.put(f"/ngl_spark_private/active/{salted_key}.json", {"updated_at": time.time()})
@@ -239,6 +238,7 @@ def process_one_job(fb: FirebaseAdminClient, private_key, hmac_secret: str) -> b
     )
 
     driver = None
+    folder = None
     try:
         def on_progress(done_count, total_count, msg):
             fb.put(f"/ngl_spark_private/active/{salted_key}.json", {"updated_at": time.time()})
@@ -253,7 +253,14 @@ def process_one_job(fb: FirebaseAdminClient, private_key, hmac_secret: str) -> b
             )
 
         driver, folder = open_session(username, password=password)
-        run_remaining(driver, folder, username, progress_callback=on_progress)
+        run_remaining(
+            driver,
+            folder,
+            username,
+            progress_callback=on_progress,
+            persist_session=False,
+            quiet_logs=True,
+        )
 
         rep_path = folder / "completion_report.json"
         total_done = 45
@@ -290,9 +297,9 @@ def process_one_job(fb: FirebaseAdminClient, private_key, hmac_secret: str) -> b
             detail=done_msg,
             completed_at=time.time(),
         )
-        print(f"[worker] Completed job {job_id} ({graded_full}/{total_done})", flush=True)
+        print(f"[worker] Completed job ({graded_full}/{total_done})", flush=True)
     except Exception as exc:
-        print(f"[worker] Failed job {job_id}: {type(exc).__name__}", flush=True)
+        print(f"[worker] Failed job: {type(exc).__name__}", flush=True)
         update_public_job(
             fb,
             job_id,
@@ -310,6 +317,8 @@ def process_one_job(fb: FirebaseAdminClient, private_key, hmac_secret: str) -> b
                 driver.quit()
             except Exception:
                 pass
+        if folder is not None:
+            shutil.rmtree(folder, ignore_errors=True)
     return True
 
 
@@ -322,6 +331,11 @@ def main():
 
     fb = FirebaseAdminClient()
     private_key, hmac_secret = load_crypto_secrets()
+    try:
+        cleanup_stale_public_jobs(fb)
+    except Exception:
+        pass
+
     worker_started = time.monotonic()
     deadline = worker_started + args.stay_alive if args.stay_alive > 0 else None
 

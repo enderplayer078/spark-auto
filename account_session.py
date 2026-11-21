@@ -167,11 +167,10 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Test NGL Spark session persistence")
     parser.add_argument("username")
-    parser.add_argument("--password")
     parser.add_argument("--headed", action="store_true")
     args = parser.parse_args()
 
-    d, f = open_session(args.username, password=args.password, headed=args.headed)
+    d, f = open_session(args.username, headed=args.headed)
     try:
         print("URL:", d.current_url)
         print("FOLDER:", f)

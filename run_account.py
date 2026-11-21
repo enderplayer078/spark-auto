@@ -15,10 +15,16 @@ import solver
 ASSIGNMENTS_HOME = "https://learn.eltngl.com/dashboard/assignments"
 
 
+def _validate_ngl_url(url: str) -> str:
+    if not isinstance(url, str) or not url.startswith("https://learn.eltngl.com/"):
+        raise RuntimeError("Unexpected assignment URL host")
+    return url
+
+
 def assignment_url(driver, folder):
     config = folder / "assignment.json"
     if config.exists():
-        return json.loads(config.read_text())["url"]
+        return _validate_ngl_url(json.loads(config.read_text())["url"])
 
     driver.switch_to.default_content()
     driver.get(ASSIGNMENTS_HOME)
@@ -28,11 +34,11 @@ def assignment_url(driver, folder):
     links = [
         e.get_attribute("href")
         for e in driver.find_elements(By.CSS_SELECTOR, '[data-qa-id="assignmentCard"] a[href]')
-        if e.is_displayed() and e.get_attribute("href")
+        if e.is_displayed() and (e.get_attribute("href") or "").startswith("https://learn.eltngl.com/")
     ]
     if not links:
         raise RuntimeError(f"No assignment card found on dashboard ({config})")
-    url = links[0]
+    url = _validate_ngl_url(links[0])
     config.write_text(json.dumps({"url": url}, indent=2) + "\n")
     return url
 
@@ -107,7 +113,7 @@ def save_completion_report(driver, folder, rows):
     return report
 
 
-def run_activity(driver, url, row, folder, activity_db=None):
+def run_activity(driver, url, row, folder, activity_db=None, quiet_logs=False):
     name = row["name"]
     driver.switch_to.default_content()
     clicked = driver.execute_script(
@@ -194,7 +200,8 @@ def run_activity(driver, url, row, folder, activity_db=None):
     all_screens = answer_guard.verify_all_screens_before_submit(driver)
     total_pts = sum(s["total"] for s in all_screens)
     correct_pts = sum(s["correct"] for s in all_screens)
-    print(f"  [{name}] pre-submit verified: {correct_pts}/{total_pts} across {len(all_screens)} screens", flush=True)
+    if not quiet_logs:
+        print(f"  [{name}] pre-submit verified: {correct_pts}/{total_pts} across {len(all_screens)} screens", flush=True)
 
     submit_res = driver.execute_async_script(
         """
@@ -233,13 +240,14 @@ def run_activity(driver, url, row, folder, activity_db=None):
             });
         """
     )
-    print(f"  RESULT {name}: {submit_res}", flush=True)
+    if not quiet_logs:
+        print(f"  RESULT {name}: {submit_res}", flush=True)
     if not submit_res or not submit_res.get("ok"):
-        raise RuntimeError(f"Submit failed for {name}: {submit_res}")
+        raise RuntimeError(f"Submit failed for {name}")
 
     score_info = submit_res.get("submitPayload") or submit_res.get("generator")
     if not score_info or score_info["correct"] != score_info["total"] or score_info["percent"] != 100:
-        raise RuntimeError(f"Score needs review for {name}: {submit_res}")
+        raise RuntimeError(f"Score needs review for {name}")
 
     with (folder / "results.jsonl").open("a") as out:
         out.write(
@@ -258,7 +266,16 @@ def run_activity(driver, url, row, folder, activity_db=None):
     time.sleep(2)
 
 
-def run_remaining(driver, folder, username, filter_text=None, min_activity_seconds=0, progress_callback=None):
+def run_remaining(
+    driver,
+    folder,
+    username,
+    filter_text=None,
+    min_activity_seconds=0,
+    progress_callback=None,
+    persist_session=True,
+    quiet_logs=False,
+):
     url = assignment_url(driver, folder)
 
     try:
@@ -276,29 +293,38 @@ def run_remaining(driver, folder, username, filter_text=None, min_activity_secon
             if is_row_completed(row):
                 continue
             if is_row_attempts_exhausted(row):
-                print(f"SKIP {name} (attempts already exhausted on dashboard)", flush=True)
+                if not quiet_logs:
+                    print(f"SKIP {name} (attempts already exhausted on dashboard)", flush=True)
                 continue
 
-            print(f"START {name}", flush=True)
+            if not quiet_logs:
+                print(f"START {name}", flush=True)
             if progress_callback:
                 progress_callback(done_count, total_count, f"กำลังทำ: {name}")
             started = time.monotonic()
 
             for attempt in range(1, 4):
                 try:
-                    run_activity(driver, url, row, folder)
+                    run_activity(driver, url, row, folder, quiet_logs=quiet_logs)
                     rows = verify_saved(driver, url, name)
                     break
                 except Exception as exc:
-                    print(f"RETRY {attempt}/3 {name}: {type(exc).__name__}", flush=True)
+                    if quiet_logs:
+                        print(f"RETRY {attempt}/3: {type(exc).__name__}", flush=True)
+                    else:
+                        print(f"RETRY {attempt}/3 {name}: {type(exc).__name__}", flush=True)
                     if attempt == 3:
-                        print(f"STOP {name}: {type(exc).__name__}", flush=True)
-                        try:
-                            driver.switch_to.default_content()
-                            (folder / "failure.html").write_text(driver.page_source)
-                            driver.save_screenshot(str(folder / "failure.png"))
-                        except Exception:
-                            pass
+                        if quiet_logs:
+                            print(f"STOP: {type(exc).__name__}", flush=True)
+                        else:
+                            print(f"STOP {name}: {type(exc).__name__}", flush=True)
+                        if persist_session:
+                            try:
+                                driver.switch_to.default_content()
+                                (folder / "failure.html").write_text(driver.page_source)
+                                driver.save_screenshot(str(folder / "failure.png"))
+                            except Exception:
+                                pass
                         raise
                     time.sleep(4)
                     rows = load_dashboard_rows(driver, url)
@@ -308,15 +334,18 @@ def run_remaining(driver, folder, username, filter_text=None, min_activity_secon
                     if latest:
                         row = latest
 
-            save_session(driver, username, folder)
+            if persist_session:
+                save_session(driver, username, folder)
             done_count = sum(1 for r in rows if is_row_completed(r) or is_row_attempts_exhausted(r))
-            print(f"VERIFIED 100% on dashboard: {name}", flush=True)
+            if not quiet_logs:
+                print(f"VERIFIED 100% on dashboard: {name}", flush=True)
             if progress_callback:
                 progress_callback(done_count, total_count, f"สำเร็จแล้ว: {name}")
 
             remaining = min_activity_seconds - (time.monotonic() - started)
             if remaining > 0:
-                print(f"PACE waiting {remaining:.1f}s before next activity", flush=True)
+                if not quiet_logs:
+                    print(f"PACE waiting {remaining:.1f}s before next activity", flush=True)
                 time.sleep(remaining)
 
         rows = load_dashboard_rows(driver, url)
@@ -332,7 +361,8 @@ def run_remaining(driver, folder, username, filter_text=None, min_activity_secon
                 flush=True,
             )
     finally:
-        save_session(driver, username, folder)
+        if persist_session:
+            save_session(driver, username, folder)
 
 
 if __name__ == "__main__":
@@ -345,14 +375,13 @@ if __name__ == "__main__":
         default=0,
         help="Minimum wall-clock time per activity, including post-save waiting",
     )
-    parser.add_argument("--password", default=None)
     parser.add_argument("--headed", action="store_true")
     args = parser.parse_args()
 
     if not 0 <= args.min_activity_seconds <= 3600:
         parser.error("Minimum activity seconds must be between 0 and 3600")
 
-    d, folder = open_session(args.username, password=args.password, headed=args.headed)
+    d, folder = open_session(args.username, headed=args.headed)
     try:
         run_remaining(d, folder, args.username, args.filter_text, args.min_activity_seconds)
     finally:
