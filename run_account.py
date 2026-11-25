@@ -1,6 +1,7 @@
 """Multi-account automated runner for NGL Spark (learn.eltngl.com)."""
 import argparse
 import json
+import random
 import re
 import time
 from pathlib import Path
@@ -113,7 +114,83 @@ def save_completion_report(driver, folder, rows):
     return report
 
 
-def run_activity(driver, url, row, folder, activity_db=None, quiet_logs=False):
+def _paced_sleep(driver, seconds: float, heartbeat_callback=None):
+    """Sleep in chunks while firing mousemove heartbeats inside the active frame to keep idleTime=0."""
+    if seconds <= 0:
+        return
+    deadline = time.monotonic() + seconds
+    next_hb = time.monotonic() + random.uniform(12.0, 18.0)
+    next_active_ping = time.monotonic() + 45.0
+    while True:
+        now = time.monotonic()
+        rem = deadline - now
+        if rem <= 0:
+            break
+        time.sleep(min(rem, 3.0))
+        now = time.monotonic()
+        if now >= next_hb:
+            try:
+                driver.execute_script(
+                    """
+                    const x = Math.floor(180 + Math.random() * 520);
+                    const y = Math.floor(140 + Math.random() * 340);
+                    window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: x, clientY: y }));
+                    document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: x, clientY: y }));
+                    """
+                )
+            except Exception:
+                pass
+            next_hb = now + random.uniform(12.0, 18.0)
+        if heartbeat_callback and now >= next_active_ping:
+            try:
+                heartbeat_callback()
+            except Exception:
+                pass
+            next_active_ping = now + 45.0
+
+
+def _build_activity_budgets(count: int, target_total_minutes: float) -> list[float]:
+    """Distribute target_total_minutes across remaining activities with natural random variance."""
+    if count <= 0 or target_total_minutes <= 0:
+        return [0.0] * max(0, count)
+    # Subtract ~7s overhead per activity (loading + dashboard verify) so wall-clock matches target
+    total_active_sec = max(0.0, target_total_minutes * 60.0 - count * 7.0)
+    if total_active_sec <= 0:
+        return [0.0] * count
+    weights = [random.uniform(0.7, 1.3) for _ in range(count)]
+    w_sum = sum(weights) or 1.0
+    return [(w / w_sum) * total_active_sec for w in weights]
+
+
+def _flush_activity_close(driver):
+    """Trigger Avallain xAPI terminated statement (keepalive) cleanly after submit."""
+    try:
+        driver.execute_script(
+            """
+            try {
+                if (window.a5 && window.a5.mainBuilder && typeof window.a5.mainBuilder.updateDuration === 'function') {
+                    window.a5.mainBuilder.updateDuration();
+                }
+                if (window.a5 && window.a5.service && window.a5.service.lms && window.a5.service.lms.API && typeof window.a5.service.lms.API.close === 'function') {
+                    window.a5.service.lms.API.close();
+                }
+            } catch (_) {}
+            """
+        )
+    except Exception:
+        pass
+
+
+def run_activity(
+    driver,
+    url,
+    row,
+    folder,
+    activity_db=None,
+    quiet_logs=False,
+    activity_budget_seconds: float = 0.0,
+    heartbeat_callback=None,
+):
     name = row["name"]
     driver.switch_to.default_content()
     clicked = driver.execute_script(
@@ -152,6 +229,12 @@ def run_activity(driver, url, row, folder, activity_db=None, quiet_logs=False):
     info = solver.get_screen_info(driver)
     total_screens = info["totalScreens"]
     expected_screens = activity_db.get("screens", []) if activity_db else []
+    activity_started = time.monotonic()
+
+    per_screen_wait = 0.0
+    if activity_budget_seconds > 0 and total_screens > 0:
+        # Allocate ~80% of budget across screens and ~20% for pre-submit review inside lo-frame
+        per_screen_wait = (activity_budget_seconds * 0.8) / total_screens
 
     for s_idx in range(total_screens):
         WebDriverWait(driver, 20, poll_frequency=0.25).until(
@@ -166,6 +249,9 @@ def run_activity(driver, url, row, folder, activity_db=None, quiet_logs=False):
                 f"  [{name}] screen {s_idx + 1}/{total_screens} ({cur_info['identifier']})",
                 flush=True,
             )
+
+        if per_screen_wait > 0:
+            _paced_sleep(driver, per_screen_wait * random.uniform(0.8, 1.2), heartbeat_callback)
 
         solver.solve_current_screen(driver, expected_screen=expected)
         verified = answer_guard.verify_screen(driver, expected_screen=expected)
@@ -203,6 +289,12 @@ def run_activity(driver, url, row, folder, activity_db=None, quiet_logs=False):
     correct_pts = sum(s["correct"] for s in all_screens)
     if not quiet_logs:
         print(f"  [{name}] pre-submit verified: {correct_pts}/{total_pts} across {len(all_screens)} screens", flush=True)
+
+    # Pace remaining activity budget INSIDE the open lo-frame BEFORE submit so xAPI duration counts it!
+    if activity_budget_seconds > 0:
+        rem_in_activity = activity_budget_seconds - (time.monotonic() - activity_started)
+        if rem_in_activity > 0:
+            _paced_sleep(driver, rem_in_activity, heartbeat_callback)
 
     submit_res = driver.execute_async_script(
         """
@@ -264,6 +356,7 @@ def run_activity(driver, url, row, folder, activity_db=None, quiet_logs=False):
             + "\n"
         )
 
+    _flush_activity_close(driver)
     time.sleep(2)
 
 
@@ -274,6 +367,8 @@ def run_remaining(
     filter_text=None,
     min_activity_seconds=0,
     progress_callback=None,
+    heartbeat_callback=None,
+    target_total_minutes: float = 0.0,
     persist_session=True,
     quiet_logs=False,
 ):
@@ -286,6 +381,16 @@ def run_remaining(
         done_count = sum(1 for r in rows if is_row_completed(r) or is_row_attempts_exhausted(r))
         if progress_callback:
             progress_callback(done_count, total_count, "ตรวจสอบรายการแบบฝึกหัด...")
+
+        todo_names = [
+            r["name"]
+            for r in rows
+            if (not filter_text or filter_text in r["name"])
+            and not is_row_completed(r)
+            and not is_row_attempts_exhausted(r)
+        ]
+        budgets = _build_activity_budgets(len(todo_names), target_total_minutes)
+        budget_map = dict(zip(todo_names, budgets))
 
         for row in rows:
             name = row["name"]
@@ -303,10 +408,19 @@ def run_remaining(
             if progress_callback:
                 progress_callback(done_count, total_count, f"กำลังทำ: {name}")
             started = time.monotonic()
+            activity_budget = max(float(min_activity_seconds or 0), float(budget_map.get(name, 0.0)))
 
             for attempt in range(1, 4):
                 try:
-                    run_activity(driver, url, row, folder, quiet_logs=quiet_logs)
+                    run_activity(
+                        driver,
+                        url,
+                        row,
+                        folder,
+                        quiet_logs=quiet_logs,
+                        activity_budget_seconds=activity_budget,
+                        heartbeat_callback=heartbeat_callback,
+                    )
                     rows = verify_saved(driver, url, name)
                     break
                 except Exception as exc:

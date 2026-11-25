@@ -1,10 +1,11 @@
-"""Firebase-backed cloud Chrome worker using scoped Service Account auth."""
+"""Firebase-backed parallel cloud Chrome worker using scoped Service Account auth and ETag CAS."""
 import argparse
 import base64
 import hashlib
 import hmac
 import json
 import os
+import random
 import re
 import shutil
 import time
@@ -23,6 +24,12 @@ SCOPES = [
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/firebase.database",
 ]
+
+STALE_JOB_SECONDS = 240 * 60
+DRAIN_GUARD_SECONDS = 900.0
+MAX_JOBS_PER_RUN = 5
+MAX_PACING_MINUTES = 135.0
+MAX_HISTORY_JOBS = 100
 
 
 class FirebaseAdminClient:
@@ -50,6 +57,18 @@ class FirebaseAdminClient:
         r.raise_for_status()
         return r.json()
 
+    def get_with_etag(self, path: str):
+        r = requests.get(
+            f"{self.base_url}{path}",
+            headers={
+                "Authorization": f"Bearer {self.get_token()}",
+                "X-Firebase-ETag": "true",
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+        return r.json(), r.headers.get("ETag", "")
+
     def put(self, path: str, payload):
         r = requests.put(
             f"{self.base_url}{path}",
@@ -62,6 +81,22 @@ class FirebaseAdminClient:
         )
         r.raise_for_status()
         return r.json()
+
+    def put_if_match(self, path: str, payload, etag: str) -> bool:
+        r = requests.put(
+            f"{self.base_url}{path}",
+            headers={
+                "Authorization": f"Bearer {self.get_token()}",
+                "Content-Type": "application/json",
+                "If-Match": etag,
+            },
+            json=payload,
+            timeout=20,
+        )
+        if r.status_code == 412:
+            return False
+        r.raise_for_status()
+        return True
 
     def patch(self, path: str, payload):
         r = requests.patch(
@@ -83,6 +118,20 @@ class FirebaseAdminClient:
             timeout=20,
         )
         r.raise_for_status()
+
+    def delete_if_match(self, path: str, etag: str) -> bool:
+        r = requests.delete(
+            f"{self.base_url}{path}",
+            headers={
+                "Authorization": f"Bearer {self.get_token()}",
+                "If-Match": etag,
+            },
+            timeout=20,
+        )
+        if r.status_code == 412:
+            return False
+        r.raise_for_status()
+        return True
 
 
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
@@ -127,6 +176,22 @@ def _safe_float(val, default: float = 0.0) -> float:
         return default
 
 
+def _resolve_target_minutes(job: dict) -> float:
+    pace_mode = str(job.get("pace_mode") or "normal").strip().lower()
+    if pace_mode == "fast":
+        return 0.0
+    raw_min = job.get("min_minutes")
+    raw_max = job.get("max_minutes")
+    if raw_min is not None or raw_max is not None:
+        lo = max(0.0, min(MAX_PACING_MINUTES, _safe_float(raw_min, 0.0)))
+        hi = max(lo, min(MAX_PACING_MINUTES, _safe_float(raw_max, lo)))
+        if hi <= 0.0:
+            return 0.0
+        return random.uniform(lo, hi)
+    # Default normal pacing (20-40 minutes) if legacy ticket lacks pace fields
+    return random.uniform(20.0, 40.0)
+
+
 def cleanup_stale_public_jobs(fb: FirebaseAdminClient, exclude_job_id: str | None = None):
     now = time.time()
     jobs_map = fb.get("/ngl_spark_public/jobs.json") or {}
@@ -141,7 +206,7 @@ def cleanup_stale_public_jobs(fb: FirebaseAdminClient, exclude_job_id: str | Non
             and j.get("status") in ("running", "queued")
         ):
             last_ts = _safe_float(j.get("updated_at") or j.get("created_at"), now)
-            if now - last_ts > 1800:
+            if now - last_ts > STALE_JOB_SECONDS:
                 fb.patch(
                     f"/ngl_spark_public/jobs/{jid}.json",
                     {
@@ -150,13 +215,17 @@ def cleanup_stale_public_jobs(fb: FirebaseAdminClient, exclude_job_id: str | Non
                         "detail": "หมดเวลาเชื่อมต่อ กรุณากดยืนยันเพื่อทำต่อจากเดิมอีกครั้ง",
                     },
                 )
-    if len(jobs_map) > 30:
+    if len(jobs_map) > MAX_HISTORY_JOBS:
         ordered = sorted(
             jobs_map.items(),
             key=lambda kv: _safe_float((kv[1] or {}).get("created_at"), 0.0),
         )
-        for old_jid, _ in ordered[:-30]:
-            if SAFE_PUBLIC_ID_RE.fullmatch(str(old_jid)):
+        for old_jid, old_val in ordered[:-MAX_HISTORY_JOBS]:
+            if (
+                SAFE_PUBLIC_ID_RE.fullmatch(str(old_jid))
+                and isinstance(old_val, dict)
+                and old_val.get("status") not in ("running", "queued")
+            ):
                 fb.delete(f"/ngl_spark_public/jobs/{old_jid}.json")
 
 
@@ -169,17 +238,30 @@ def update_public_job(fb: FirebaseAdminClient, job_id: str, **fields):
 
 
 def increment_completed_stats(fb: FirebaseAdminClient):
+    """Atomically increment completed_count using RTDB ETag CAS to prevent lost updates."""
+    for _ in range(5):
+        stats, etag = fb.get_with_etag("/ngl_spark_public/stats.json")
+        current = int((stats or {}).get("completed_count") or 0) if isinstance(stats, dict) else 0
+        payload = {"completed_count": current + 1}
+        if not etag:
+            fb.put("/ngl_spark_public/stats.json", payload)
+            return
+        if fb.put_if_match("/ngl_spark_public/stats.json", payload, etag):
+            return
+        time.sleep(0.25)
+    # Final fallback after retries
     stats = fb.get("/ngl_spark_public/stats.json") or {}
     count = int(stats.get("completed_count") or 0) + 1
     fb.put("/ngl_spark_public/stats.json", {"completed_count": count})
 
 
-def process_one_job(fb: FirebaseAdminClient, private_key, hmac_secret: str) -> bool:
+def _claim_next_job_atomic(fb: FirebaseAdminClient):
+    """Atomically claim the oldest valid inbox job via ETag CAS (zero double-claim)."""
     inbox = fb.get("/ngl_spark_private/inbox.json")
     if not isinstance(inbox, dict) or not inbox:
-        return False
+        return None, None
 
-    items = []
+    candidates = []
     for k, v in inbox.items():
         valid_item = (
             isinstance(v, dict)
@@ -192,24 +274,38 @@ def process_one_job(fb: FirebaseAdminClient, private_key, hmac_secret: str) -> b
             and 100 <= len(v["encrypted_password"]) <= 1024
         )
         if valid_item:
-            items.append((k, v))
+            candidates.append((k, v))
         elif SAFE_PUBLIC_ID_RE.fullmatch(str(k)):
             try:
                 fb.delete(f"/ngl_spark_private/inbox/{k}.json")
             except Exception:
                 pass
-    if not items:
+    if not candidates:
+        return None, None
+
+    candidates.sort(key=lambda kv: _safe_float(kv[1].get("created_at"), 0.0))
+
+    for job_id, _ in candidates:
+        path = f"/ngl_spark_private/inbox/{job_id}.json"
+        ticket, etag = fb.get_with_etag(path)
+        if not isinstance(ticket, dict) or not etag or etag == "null_etag":
+            continue
+        if fb.delete_if_match(path, etag):
+            return job_id, ticket
+    return None, None
+
+
+def process_one_job(fb: FirebaseAdminClient, private_key, hmac_secret: str) -> bool:
+    job_id, job = _claim_next_job_atomic(fb)
+    if not job_id or not job:
         return False
 
-    items.sort(key=lambda kv: _safe_float(kv[1].get("created_at"), 0.0))
-    job_id, job = items[0]
     username = job["username"]
     enc_password = job["encrypted_password"]
     display_name = str(job.get("display_name") or "ผู้ใช้งาน").strip()[:32] or "ผู้ใช้งาน"
+    target_minutes = _resolve_target_minutes(job)
 
-    # Claim the job and immediately delete encrypted credentials from inbox.
-    fb.delete(f"/ngl_spark_private/inbox/{job_id}.json")
-    print("[worker] Claimed 1 job", flush=True)
+    print(f"[worker] Claimed 1 job (target ~{target_minutes:.1f}m)", flush=True)
 
     try:
         password = decrypt_password(private_key, enc_password)
@@ -252,12 +348,20 @@ def process_one_job(fb: FirebaseAdminClient, private_key, hmac_secret: str) -> b
                 detail=msg,
             )
 
+        def on_heartbeat():
+            try:
+                fb.put(f"/ngl_spark_private/active/{salted_key}.json", {"updated_at": time.time()})
+            except Exception:
+                pass
+
         driver, folder = open_session(username, password=password, persist_session=False)
         run_remaining(
             driver,
             folder,
             username,
             progress_callback=on_progress,
+            heartbeat_callback=on_heartbeat,
+            target_total_minutes=target_minutes,
             persist_session=False,
             quiet_logs=True,
         )
@@ -338,17 +442,24 @@ def main():
 
     worker_started = time.monotonic()
     deadline = worker_started + args.stay_alive if args.stay_alive > 0 else None
+    processed = 0
 
     while True:
-        if not args.loop and time.monotonic() - worker_started > 7200:
-            print("[worker] Reached 2-hour soft limit between jobs; exiting cleanly.", flush=True)
+        if not args.loop and processed >= MAX_JOBS_PER_RUN:
+            print("[worker] Reached max jobs per run; exiting cleanly.", flush=True)
             break
+        if not args.loop and processed > 0 and (time.monotonic() - worker_started) >= DRAIN_GUARD_SECONDS:
+            print("[worker] Drain guard (15m) reached; leaving remaining queue for parallel runners.", flush=True)
+            break
+
         did_work = process_one_job(fb, private_key, hmac_secret)
+        if did_work:
+            processed += 1
+            continue
+
         if not args.loop and (deadline is None or time.monotonic() >= deadline):
-            if not did_work:
-                break
-        if not did_work:
-            time.sleep(args.poll_interval)
+            break
+        time.sleep(args.poll_interval)
 
 
 if __name__ == "__main__":

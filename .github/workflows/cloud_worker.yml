@@ -6,14 +6,10 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: spark-auto-worker
-  cancel-in-progress: false
-
 jobs:
   run-queue:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 240
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
