@@ -1,7 +1,6 @@
-"""Reusable Avallain Buckminster frame switcher and solver for all 9 NGL Spark interaction types."""
+"""Reusable Avallain Buckminster frame switcher and solver for all 10 NGL Spark interaction types."""
 import time
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
 
 
 def switch_to_inner_frame(driver, timeout=30):
@@ -106,7 +105,9 @@ def solve_current_screen(driver, expected_screen=None):
             // 1. Multiple Choice (Single Answer)
             if (cls === 'a5.models.interaction.ISRadiobuttonModel') {
                 if (!isPrefilled(item) && item.correct) {
-                    item.correct.select();
+                    if (!item.correct.selected) {
+                        item.correct.select();
+                    }
                     solved.push({ cls, value: item.correct.text || item.correct.html });
                 }
                 continue;
@@ -128,9 +129,13 @@ def solve_current_screen(driver, expected_screen=None):
                 continue;
             }
 
-            // 3. Dropdown
+            // 3. Dropdown (preserves Attempt-1 correct items kept on retake / tryAgainKeep)
             if (cls === 'a5.models.interaction.ISDropdownModel') {
                 if (!isPrefilled(item)) {
+                    if (item.selected && item.selected.correct) {
+                        solved.push({ cls, value: item.selected.text || item.selected.html, kept: true });
+                        continue;
+                    }
                     const choice = item.hasOrderedResponses
                         ? item.getCorrect()
                         : (typeof item.findNextCorrect === 'function' ? item.findNextCorrect() : item.getCorrect());
@@ -157,10 +162,16 @@ def solve_current_screen(driver, expected_screen=None):
                 continue;
             }
 
-            // 5. FIB Drag & Drop (GapMatchInteraction)
+            // 5. FIB Drag & Drop (GapMatchInteraction — preserves Attempt-1 correct items on retake / tryAgainKeep)
             if (cls === 'a5.models.interaction.GapMatchInteraction') {
                 for (const tda of (item.targetDropAreas || [])) {
-                    if (!isPrefilled(tda) && tda.drag && (typeof tda.isCorrectable !== 'function' || tda.isCorrectable())) {
+                    const alreadyCorrect = typeof tda.isCorrect === 'function' && tda.isCorrect();
+                    if (
+                        !isPrefilled(tda)
+                        && !alreadyCorrect
+                        && tda.drag
+                        && (typeof tda.isCorrectable !== 'function' || tda.isCorrectable())
+                    ) {
                         const old = tda.drag;
                         tda.undrop(old);
                         if (old && old.home) old.home.drop(old);
@@ -169,6 +180,10 @@ def solve_current_screen(driver, expected_screen=None):
                 const drops = [];
                 for (const tda of (item.targetDropAreas || [])) {
                     if (isPrefilled(tda) || (typeof tda.isCorrectable === 'function' && !tda.isCorrectable())) {
+                        continue;
+                    }
+                    if (typeof tda.isCorrect === 'function' && tda.isCorrect() && tda.drag) {
+                        drops.push({ gap: tda.identifier, drag: tda.drag.identifier, kept: true });
                         continue;
                     }
                     let drag = typeof tda.getCorrect === 'function' ? tda.getCorrect() : null;
@@ -300,6 +315,28 @@ def solve_current_screen(driver, expected_screen=None):
                     }
                 }
                 solved.push({ cls, value: item.value });
+                continue;
+            }
+
+            // 10. Matching with Lines (LLModel / SDY15 / associateInteraction)
+            if (cls === 'a5.models.interaction.LLModel') {
+                if (!isPrefilled(item)) {
+                    if (typeof item.clearUserData === 'function') {
+                        item.clearUserData();
+                    } else if (Array.isArray(item.lines)) {
+                        item.lines = (item.prefilledLines || []).slice();
+                    }
+                    const pairs = typeof item.correctModels === 'function' ? item.correctModels() : [];
+                    if (!pairs.length) {
+                        return { ok: false, error: 'LLModel correctModels not found' };
+                    }
+                    for (const pair of pairs) {
+                        if (Array.isArray(pair) && pair.length === 2 && pair[0] && pair[1]) {
+                            item.addLine(pair[0], pair[1]);
+                        }
+                    }
+                    solved.push({ cls, pairs: pairs.length });
+                }
                 continue;
             }
         }
