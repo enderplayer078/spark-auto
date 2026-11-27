@@ -14,6 +14,12 @@ import answer_guard
 import solver
 
 ASSIGNMENTS_HOME = "https://learn.eltngl.com/dashboard/assignments"
+UNIT_PREFIX_RE = re.compile(r"^\s*(Unit\s+\d+)\b", re.IGNORECASE)
+
+
+def _extract_unit_label(name: str) -> str:
+    m = UNIT_PREFIX_RE.match(str(name or ""))
+    return m.group(1).strip().lower() if m else ""
 
 
 def _validate_ngl_url(url: str) -> str:
@@ -369,6 +375,8 @@ def run_remaining(
     progress_callback=None,
     heartbeat_callback=None,
     target_total_minutes: float = 0.0,
+    max_units: int = 0,
+    max_activities: int = 0,
     persist_session=True,
     quiet_logs=False,
 ):
@@ -376,24 +384,58 @@ def run_remaining(
 
     try:
         rows = load_dashboard_rows(driver, url)
-        print(f"Loaded {len(rows)} activities on dashboard", flush=True)
+        if not quiet_logs:
+            print(f"Loaded {len(rows)} activities on dashboard", flush=True)
         total_count = len(rows)
         done_count = sum(1 for r in rows if is_row_completed(r) or is_row_attempts_exhausted(r))
         if progress_callback:
             progress_callback(done_count, total_count, "ตรวจสอบรายการแบบฝึกหัด...")
 
-        todo_names = [
+        candidate_names = [
             r["name"]
             for r in rows
             if (not filter_text or filter_text in r["name"])
             and not is_row_completed(r)
             and not is_row_attempts_exhausted(r)
         ]
-        budgets = _build_activity_budgets(len(todo_names), target_total_minutes)
-        budget_map = dict(zip(todo_names, budgets))
+
+        selected_names: list[str] = []
+        if max_units and max_units > 0:
+            selected_units: list[str] = []
+            has_unit_labels = any(_extract_unit_label(nm) for nm in candidate_names)
+            if has_unit_labels:
+                for nm in candidate_names:
+                    ulab = _extract_unit_label(nm)
+                    if ulab:
+                        if ulab not in selected_units:
+                            if len(selected_units) >= max_units:
+                                continue
+                            selected_units.append(ulab)
+                        selected_names.append(nm)
+            else:
+                selected_names = candidate_names[: max_units * 10]
+        else:
+            selected_names = list(candidate_names)
+
+        if max_activities and max_activities > 0:
+            selected_names = selected_names[:max_activities]
+
+        selected_name_set = set(selected_names)
+        is_limited_run = bool((max_units and max_units > 0) or (max_activities and max_activities > 0))
+
+        # Scale pacing duration proportionally so partial runs + remaining runs add up naturally
+        effective_target_minutes = float(target_total_minutes or 0.0)
+        if effective_target_minutes > 0 and total_count > 0 and len(selected_names) < total_count:
+            effective_target_minutes = effective_target_minutes * (len(selected_names) / float(total_count))
+
+        budgets = _build_activity_budgets(len(selected_names), effective_target_minutes)
+        budget_map = dict(zip(selected_names, budgets))
+        ran_this_session = 0
 
         for row in rows:
             name = row["name"]
+            if name not in selected_name_set:
+                continue
             if filter_text and filter_text not in name:
                 continue
             if is_row_completed(row):
@@ -449,6 +491,7 @@ def run_remaining(
                     if latest:
                         row = latest
 
+            ran_this_session += 1
             if persist_session:
                 save_session(driver, username, folder)
             done_count = sum(1 for r in rows if is_row_completed(r) or is_row_attempts_exhausted(r))
@@ -467,14 +510,33 @@ def run_remaining(
         (folder / "progress.txt").write_text(
             "\n".join(f"{r['name']} -> {r['text']}" for r in rows) + "\n"
         )
-        if not filter_text:
+        completed_count = sum(1 for r in rows if is_row_completed(r) or is_row_attempts_exhausted(r))
+        full_score_count = sum(1 for r in rows if is_row_completed(r))
+        all_completed = len(rows) > 0 and completed_count >= len(rows)
+
+        if not filter_text and not is_limited_run and not all_completed:
+            raise RuntimeError(f"Incomplete activities remain ({completed_count}/{len(rows)})")
+
+        if all_completed and not filter_text:
             report = save_completion_report(driver, folder, rows)
             if progress_callback:
                 progress_callback(len(rows), len(rows), "ทำแบบฝึกหัดครบ 100% ทุกข้อแล้ว")
-            print(
-                f"ALL COMPLETE: {report['completed']} activities, {report['graded_full_score']} at 100%",
-                flush=True,
-            )
+            if not quiet_logs:
+                print(
+                    f"ALL COMPLETE: {report['completed']} activities, {report['graded_full_score']} at 100%",
+                    flush=True,
+                )
+        elif progress_callback:
+            progress_callback(completed_count, len(rows), f"ทำเสร็จแล้ว {completed_count}/{len(rows)} ข้อ")
+
+        return {
+            "total": len(rows),
+            "completed": completed_count,
+            "graded_full_score": full_score_count,
+            "all_completed": all_completed,
+            "partial": not all_completed,
+            "ran_this_session": ran_this_session,
+        }
     finally:
         if persist_session:
             save_session(driver, username, folder)
@@ -490,6 +552,18 @@ if __name__ == "__main__":
         default=0,
         help="Minimum wall-clock time per activity, including post-save waiting",
     )
+    parser.add_argument(
+        "--max-units",
+        type=int,
+        default=0,
+        help="Optional limit on number of incomplete units to complete (0 = all)",
+    )
+    parser.add_argument(
+        "--max-activities",
+        type=int,
+        default=0,
+        help="Optional hard limit on number of activities to complete (0 = all)",
+    )
     parser.add_argument("--headed", action="store_true")
     args = parser.parse_args()
 
@@ -498,6 +572,15 @@ if __name__ == "__main__":
 
     d, folder = open_session(args.username, headed=args.headed)
     try:
-        run_remaining(d, folder, args.username, args.filter_text, args.min_activity_seconds)
+        summary = run_remaining(
+            d,
+            folder,
+            args.username,
+            filter_text=args.filter_text,
+            min_activity_seconds=args.min_activity_seconds,
+            max_units=max(0, args.max_units),
+            max_activities=max(0, args.max_activities),
+        )
+        print("SUMMARY:", summary, flush=True)
     finally:
         d.quit()

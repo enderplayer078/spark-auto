@@ -238,21 +238,21 @@ def update_public_job(fb: FirebaseAdminClient, job_id: str, **fields):
 
 
 def increment_completed_stats(fb: FirebaseAdminClient):
-    """Atomically increment completed_count using RTDB ETag CAS to prevent lost updates."""
+    """Atomically increment completed_count using RTDB ETag CAS without clobbering sibling keys."""
+    path = "/ngl_spark_public/stats/completed_count.json"
     for _ in range(5):
-        stats, etag = fb.get_with_etag("/ngl_spark_public/stats.json")
-        current = int((stats or {}).get("completed_count") or 0) if isinstance(stats, dict) else 0
-        payload = {"completed_count": current + 1}
-        if not etag:
-            fb.put("/ngl_spark_public/stats.json", payload)
+        current_val, etag = fb.get_with_etag(path)
+        current = int(current_val) if isinstance(current_val, (int, float)) else 0
+        next_val = current + 1
+        if not etag or etag == "null_etag":
+            fb.put(path, next_val)
             return
-        if fb.put_if_match("/ngl_spark_public/stats.json", payload, etag):
+        if fb.put_if_match(path, next_val, etag):
             return
         time.sleep(0.25)
-    # Final fallback after retries
-    stats = fb.get("/ngl_spark_public/stats.json") or {}
-    count = int(stats.get("completed_count") or 0) + 1
-    fb.put("/ngl_spark_public/stats.json", {"completed_count": count})
+    current_val = fb.get(path)
+    current = int(current_val) if isinstance(current_val, (int, float)) else 0
+    fb.put(path, current + 1)
 
 
 def _claim_next_job_atomic(fb: FirebaseAdminClient):
@@ -354,54 +354,73 @@ def process_one_job(fb: FirebaseAdminClient, private_key, hmac_secret: str) -> b
             except Exception:
                 pass
 
+        try:
+            max_units = max(0, min(10, int(job.get("max_units") or job.get("maxUnits") or 0)))
+        except (TypeError, ValueError):
+            max_units = 0
+        try:
+            max_activities = max(0, min(200, int(job.get("max_activities") or job.get("maxActivities") or 0)))
+        except (TypeError, ValueError):
+            max_activities = 0
+
         driver, folder = open_session(username, password=password, persist_session=False)
-        run_remaining(
+        summary = run_remaining(
             driver,
             folder,
             username,
             progress_callback=on_progress,
             heartbeat_callback=on_heartbeat,
             target_total_minutes=target_minutes,
+            max_units=max_units,
+            max_activities=max_activities,
             persist_session=False,
             quiet_logs=True,
         )
 
-        rep_path = folder / "completion_report.json"
-        total_done = 45
-        graded_full = 45
-        if rep_path.exists():
-            try:
-                rep_data = json.loads(rep_path.read_text())
-                total_done = int(rep_data.get("completed", 45))
-                graded_full = int(rep_data.get("graded_full_score", total_done))
-            except Exception:
-                pass
+        final_total = max(int((summary or {}).get("total", 45) or 45), 1)
+        total_done = min(final_total, max(0, int((summary or {}).get("completed", final_total) or 0)))
+        graded_full = min(final_total, max(0, int((summary or {}).get("graded_full_score", total_done) or 0)))
+        is_all_done = bool((summary or {}).get("all_completed", total_done >= final_total))
 
-        done_msg = (
-            f"ทำแบบฝึกหัดครบ {total_done}/{total_done} ข้อ (100%)"
-            if graded_full == total_done
-            else f"ทำข้อที่เหลือสำเร็จแล้ว ({graded_full}/{total_done} ข้อได้ 100%, ข้าม {total_done - graded_full} ข้อที่ใช้สิทธิ์ทำครบแล้ว)"
-        )
+        if is_all_done:
+            done_msg = (
+                f"ทำแบบฝึกหัดครบ {total_done}/{final_total} ข้อ (100%)"
+                if graded_full == total_done
+                else f"ทำข้อที่เหลือสำเร็จแล้ว ({graded_full}/{final_total} ข้อได้ 100%, ข้าม {total_done - graded_full} ข้อที่ใช้สิทธิ์ทำครบแล้ว)"
+            )
+            already_marked = fb.get(f"/ngl_spark_private/completed/{salted_key}.json")
+            fb.put(
+                f"/ngl_spark_private/completed/{salted_key}.json",
+                {"completed": True, "completed_at": time.time()},
+            )
+            if not already_marked:
+                increment_completed_stats(fb)
 
-        already_marked = fb.get(f"/ngl_spark_private/completed/{salted_key}.json")
-        fb.put(
-            f"/ngl_spark_private/completed/{salted_key}.json",
-            {"completed": True, "completed_at": time.time()},
-        )
-        if not already_marked:
-            increment_completed_stats(fb)
-
-        update_public_job(
-            fb,
-            job_id,
-            display_name=display_name,
-            status="completed",
-            done_activities=total_done,
-            total_activities=total_done,
-            detail=done_msg,
-            completed_at=time.time(),
-        )
-        print(f"[worker] Completed job ({graded_full}/{total_done})", flush=True)
+            update_public_job(
+                fb,
+                job_id,
+                display_name=display_name,
+                status="completed",
+                done_activities=total_done,
+                total_activities=final_total,
+                partial=False,
+                detail=done_msg,
+                completed_at=time.time(),
+            )
+            print(f"[worker] Completed job ({graded_full}/{final_total})", flush=True)
+        else:
+            update_public_job(
+                fb,
+                job_id,
+                display_name=display_name,
+                status="completed",
+                done_activities=total_done,
+                total_activities=final_total,
+                partial=True,
+                detail=f"ทำแบบฝึกหัดเสร็จแล้ว {total_done}/{final_total} ข้อ",
+                completed_at=time.time(),
+            )
+            print(f"[worker] Partial job completed ({total_done}/{final_total})", flush=True)
     except Exception as exc:
         print(f"[worker] Failed job: {type(exc).__name__}", flush=True)
         update_public_job(
